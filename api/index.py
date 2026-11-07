@@ -3,10 +3,13 @@ Template Flask Login -> Dashboard
 Deploy: Vercel | Database: Supabase (PostgreSQL)
 """
 import os
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from functools import wraps
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 from sqlalchemy.pool import NullPool
 from werkzeug.security import check_password_hash
 
@@ -29,6 +32,8 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"poolclass": NullPool}
 
 db = SQLAlchemy(app)
 
+WIB = ZoneInfo("Asia/Jakarta")
+
 
 class User(db.Model):
     __tablename__ = "users"
@@ -36,6 +41,30 @@ class User(db.Model):
     username = db.Column(db.String(50), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     nama = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=func.now())
+
+    @property
+    def created_at_wib(self):
+        """Konversi timestamp created_at ke zona waktu WIB (UTC+7)."""
+        if not self.created_at:
+            return None
+        dt = self.created_at
+        if dt.tzinfo is None:
+            # Timestamp dari database Supabase / UTC disimpan naive atau UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(WIB)
+
+
+@app.template_filter("wib_format")
+def wib_format_filter(dt_val, fmt="%d %b %Y, %H:%M WIB"):
+    """Filter template Jinja untuk memformat tanggal ke zona waktu WIB."""
+    if not dt_val:
+        return "-"
+    if isinstance(dt_val, datetime):
+        if dt_val.tzinfo is None:
+            dt_val = dt_val.replace(tzinfo=timezone.utc)
+        return dt_val.astimezone(WIB).strftime(fmt)
+    return str(dt_val)
 
 
 def login_required(view):
@@ -74,7 +103,63 @@ def login():
 @login_required
 def dashboard():
     total_user = User.query.count()
-    return render_template("dashboard.html", nama=session["nama"], total_user=total_user)
+
+    # Perhitungan waktu berdasarkan zona waktu WIB (Asia/Jakarta, UTC+7)
+    sekarang_wib = datetime.now(WIB)
+    awal_hari_wib = sekarang_wib.replace(hour=0, minute=0, second=0, microsecond=0)
+    tujuh_hari_lalu_wib = awal_hari_wib - timedelta(days=6)
+
+    # Konversi batas waktu WIB ke UTC untuk query database (kolom created_at UTC)
+    awal_hari_utc = awal_hari_wib.astimezone(timezone.utc).replace(tzinfo=None)
+    tujuh_hari_lalu_utc = tujuh_hari_lalu_wib.astimezone(timezone.utc).replace(tzinfo=None)
+
+    user_hari_ini = User.query.filter(User.created_at >= awal_hari_utc).count()
+    user_7_hari = User.query.filter(User.created_at >= tujuh_hari_lalu_utc).count()
+    user_lama = max(0, total_user - user_7_hari)
+
+    # Menghitung pendaftaran user per hari dalam rentang 7 hari terakhir (WIB)
+    label_7_hari = []
+    data_7_hari = []
+    for i in range(6, -1, -1):
+        target_hari_wib = awal_hari_wib - timedelta(days=i)
+        esok_hari_wib = target_hari_wib + timedelta(days=1)
+
+        # Rentang hari dalam format UTC naive untuk query database
+        target_utc = target_hari_wib.astimezone(timezone.utc).replace(tzinfo=None)
+        esok_utc = esok_hari_wib.astimezone(timezone.utc).replace(tzinfo=None)
+
+        count_hari = User.query.filter(
+            User.created_at >= target_utc,
+            User.created_at < esok_utc
+        ).count()
+        label_7_hari.append(target_hari_wib.strftime("%d %b"))
+        data_7_hari.append(count_hari)
+
+    # Ambil daftar pengguna terbaru untuk tabel
+    users_list = User.query.order_by(User.created_at.desc(), User.id.desc()).all()
+
+    # Format tanggal lokal Indonesia / readable
+    bulan_indo = [
+        "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+        "Juli", "Agustus", "September", "Oktober", "November", "Desember"
+    ]
+    hari_indo = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+    hari_str = hari_indo[sekarang_wib.weekday()]
+    tgl_str = f"{hari_str}, {sekarang_wib.day} {bulan_indo[sekarang_wib.month - 1]} {sekarang_wib.year} (WIB)"
+
+    return render_template(
+        "dashboard.html",
+        nama=session["nama"],
+        total_user=total_user,
+        user_hari_ini=user_hari_ini,
+        user_7_hari=user_7_hari,
+        tanggal_hari_ini=tgl_str,
+        chart_line_labels=label_7_hari,
+        chart_line_data=data_7_hari,
+        chart_donut_data=[user_7_hari, user_lama],
+        chart_donut_labels=["User Baru (≤ 7 hari)", "User Lama (> 7 hari)"],
+        users=users_list,
+    )
 
 
 @app.route("/logout")
